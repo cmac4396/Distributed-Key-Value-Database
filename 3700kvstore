@@ -1,0 +1,747 @@
+#!/usr/bin/env python3
+import copy
+import json
+import random
+import select
+import socket
+import sys
+import time
+
+# Your ID number
+my_id = sys.argv[1]
+
+# The current Leader
+curr_leader = "FFFF"
+
+# Request Buffer
+queue = []
+# The election timeout
+election_timeout = random.randint(300, 450)
+
+# Your votes
+votesReceived = 1
+
+# States
+states = ['follower', 'candidate', 'leader']
+
+FOLLOWER = states[0]
+CANDIDATE = states[1]
+LEADER = states[2]
+
+# Your state
+state = FOLLOWER
+
+# Persistent State
+# latest term server has seen
+currentTerm = 0
+# candidateId that received vote in current term
+votedFor = None
+# log entries
+log = []
+
+# data store
+data = {}
+
+# Volatile state on all servers:
+# index of highest log entry known to be committed
+commitIndex = 0
+# index of highest log entry applied to state machine
+lastApplied = 0
+
+# Volatile state on leaders:
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+# index of the next log entry to send to that server
+nextIndex = {}
+
+# index of highest log entry known to be replicated on server
+matchIndex = {}
+
+# pairs of unresponded get requests along with the matching commitIndex when they should be responded to
+unresponded_gets = []
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(my_id)
+
+election_timeout_last = round(time.time() * 1000)
+
+heartbeat_last = round(time.time() * 1000)
+
+SELECT_WAIT_TIME = 0.001  # 1 millisecond
+TERMINATOR = b'}\n'
+buffer = b''
+
+
+# Receive
+def recv_msgs():
+    global buffer, sock
+
+    fresh_buf = sock.recv(16384)
+
+    # is this sock shutting down?
+    if len(fresh_buf) == 0:
+        return None
+
+    buffer += fresh_buf
+
+    msgs = []
+    while TERMINATOR in buffer:
+        position = buffer.find(TERMINATOR) + len(TERMINATOR)
+        msgs.append(json.loads(buffer[:position - 1].decode()))  # -1 to remove the \n, which json.loads won't want
+        buffer = buffer[position:]
+
+    return msgs
+
+
+def send_fail(message):
+    """sends a fail message to the client if an invalid request is sent"""
+    global sock
+    fail_message = {
+        'src': message['dst'],
+        'dst': message['src'],
+        'leader': message['leader'],
+        'type': 'fail',
+        'MID': message['MID']
+    }
+
+    send_msg(fail_message)
+
+
+def restart_election_timeout():
+    """Restarts the election timeout of this replica"""
+
+    global election_timeout, election_timeout_last
+
+    election_timeout = random.randint(300, 450)
+    election_timeout_last = current_milli_time()
+
+
+def is_atleast_up_to_date(lastLogTermCandidate, lastLogIndexCandidate):
+    """Checks if this log is atleast up date compared to another log, but it is given the last log index and term of another log"""
+    global log
+    lastLogIndex = len(log) - 1 if len(log) > 1 else 0
+    lastLogTerm = log[lastLogIndex]['term'] if len(log) > 1 else 0
+
+    # voter denies vote if its own log is more up to date
+    # log is more up to date if terms are different and its term is larger or if the logs
+    # have the same term and the log is longer
+    if lastLogTerm > lastLogTermCandidate:
+        return False
+    elif lastLogTerm == lastLogTermCandidate and lastLogIndex > lastLogIndexCandidate:
+        return False
+    else:
+        return True
+
+
+def current_milli_time():
+    """Gets the current time in miliseconds"""
+    return round(time.time() * 1000)
+
+
+def handle_receiving_request_vote(request_vote_msg):
+    """Handles receiving the request to vote"""
+    global sock, state, states, curr_leader
+
+    restart_election_timeout()
+    curr_leader = "FFFF"
+    # only vote if replica is a follower and the leader is unknown
+    if state == FOLLOWER:
+        voteGranted = None
+        # if term of message is less than the current term, do not vote for candidate who sent message
+        if request_vote_msg['term'] < currentTerm:
+            voteGranted = False
+        elif (votedFor is None or votedFor == request_vote_msg['src']) and is_atleast_up_to_date(
+                request_vote_msg['lastLogTerm'], request_vote_msg['lastLogIndex']):
+            # if log is up to date and replica has not voted for anyone this term, vote for candidate
+            voteGranted = True
+        # Sending the reply back if the vote if granted
+        if voteGranted:
+            send_request_vote_reply(request_vote_msg, voteGranted)
+
+
+def handle_receiving_request_vote_reply(request_vote_reply_msg):
+    """Handles receiving request vote replies"""
+    global votesReceived, state, curr_leader, states, queue, nextIndex, matchIndex, replica_ids, log, lastApplied
+
+    # only process a RequestVote response if replica is still a candidate holding an election
+    if state == CANDIDATE:
+        if request_vote_reply_msg['voteGranted']:
+            votesReceived += 1
+
+        if state != LEADER and votesReceived > len(replica_ids) / 2:
+            # restart_election_timeout()
+            # Makes this state the leader and sends a heartbeat right after
+            state = LEADER
+
+            # assume that all requests in this log are committed (WILL PROBABLY BREAK ON DROP)
+            process_log()
+
+            # commitIndex = len(log) - 1 if len(log) > 1 else 0
+            lastApplied = copy.deepcopy(commitIndex)
+
+            # clear previous get responses
+            send_get_responses()
+
+            # Reset nextIndex and matchIndex
+            for replica_id in replica_ids:
+                nextIndex[replica_id] = len(log) if len(log) > 0 else 1
+                matchIndex[replica_id] = 0
+            # reset number of votes received because replica is no longer holding an election
+            votesReceived = 1
+            # change leader id to replica id, leader is known as self
+            curr_leader = my_id
+            send_append_entry([])
+
+            # process all requests received during election/candidate state
+            for entry in queue:
+                if entry not in log and entry['type'] == 'put':
+                    add_to_log(entry)
+                    # send_append_entry([entry])
+                elif entry['type'] == 'get':
+                    # send_get_response(entry)
+                    process_get(entry)
+
+            # empty the queue after processing requests
+            queue.clear()
+
+
+def send_append_entry(entry):
+    """sends a request to vote message"""
+    global log
+    # index of log entry immediately preceding new ones
+    # if we are committing 1 message at a time, subtract 1 + 1 = 2
+    prevLogIndex = len(log) - 2 if len(log) > 2 else 0
+    # term of prevLogIndex entry
+    prevLogTerm = log[prevLogIndex]['term'] if prevLogIndex > 0 else 0
+
+    append_entry_msg = {
+        'src': my_id,
+        'dst': 'FFFF',
+        'leader': my_id,
+        'type': 'append_entry',
+        'term': currentTerm,
+        'prevLogIndex': prevLogIndex,
+        'prevLogTerm': prevLogTerm,
+        'entries': entry,
+        'leaderCommit': commitIndex
+    }
+
+    send_msg(append_entry_msg)
+
+
+def send_append_entry_reply(append_entry_msg):
+    """sends a request to vote message"""
+    global curr_leader, currentTerm, log
+
+    append_entry_reply_msg = {
+        'src': my_id,
+        'dst': append_entry_msg['src'],
+        'type': 'append_entry_reply',
+        'leader': curr_leader,
+        'term': currentTerm,
+        'success': should_append(append_entry_msg),
+        'matchIndex': len(log) - 1 if len(log) > 1 else 0
+    }
+    send_msg(append_entry_reply_msg)
+
+
+def should_append(append_entry_msg):
+    """returns True if the replica should respond True to the AppendEntry RPC received"""
+    global log, currentTerm
+    # receiver implementation (1): reply false if term < currentTerm
+    if append_entry_msg['term'] < currentTerm:
+        return False
+
+    if len(log) < 1 or append_entry_msg['prevLogIndex'] < 1:
+        return True
+    else:
+        try:
+            previousEntry = log[append_entry_msg['prevLogIndex']]
+            previousEntryTerm = previousEntry['term']
+
+            # receiver implementation (2): reply false if entry at prevLogIndex's term does not match
+            # prevLogTerm
+            if previousEntryTerm != append_entry_msg['prevLogTerm']:
+                return False
+            else:
+                return True
+        except IndexError:
+            # receiver implementation (2): reply false if log doesn't contain an entry at prevLogIndex
+            return False
+
+
+def handle_receiving_append_entry_msg(append_entry_msg):
+    """Handles receiving append entry messages"""
+    global state, states, curr_leader, queue, sock, votesReceived, commitIndex, log, currentTerm, votedFor
+
+    # if a candidate receives an append entry message, revert to follower state
+    if state == CANDIDATE and msg['term'] >= currentTerm:
+        state = FOLLOWER
+
+        # reset state variables after falling out of candidate state
+        votesReceived = 1
+        currentTerm = msg['term']
+        votedFor = None
+        curr_leader = msg['leader']
+
+    if should_append(append_entry_msg):
+        restart_election_timeout()
+        # send the queued requests received in candidate state to the appropriate leader
+        for entry in queue:
+            send_msg(entry)
+
+        # empty the queue after processing requests
+        queue.clear()
+
+        # send any unresponded get requests received in a former leader state to the new leader
+        for index, message in unresponded_gets:
+            send_msg(message)
+        unresponded_gets.clear()
+
+        # receiver implementation (3): if an existing entry conflicts with a new one
+        # (same index but different terms), delete the existing entry and all that follow it
+        if append_entry_msg['prevLogIndex'] < len(log) - 1 and len(log) > 1:
+            for entryIndex in range(len(append_entry_msg['entries'])):
+                # use entries and prevLogIndex to calculate index of entries in leader's log
+                indexInLog = entryIndex + append_entry_msg['prevLogIndex'] + 1
+
+                entryInLog = None
+                try:
+                    entryInLog = log[indexInLog]
+                except IndexError:
+                    break
+
+                try:
+                    # if terms are not equal for an entry with an index in this log, delete entries
+                    if entryInLog['term'] != append_entry_msg['entries'][entryIndex]['term']:
+                        while len(log) - 1 >= indexInLog:
+                            log.pop()
+
+                        break
+                except KeyError:
+                    # do not compare dummy message
+                    pass
+
+        # receiver implementation (4): append any new entries not already in the log
+        # add an empty message to index at 0
+        if len(log) == 0:
+            log.append({'first message': True})
+
+        for entry in append_entry_msg['entries']:
+            if entry not in log and entry['type'] == 'put':
+                add_to_log(entry)
+
+        # receiver implementation (5): if leaderCommit > commitIndex,
+        # set commitIndex = min(leaderCommit, index of last new entry)
+        if append_entry_msg['leaderCommit'] > commitIndex:
+            commitIndex = min(append_entry_msg['leaderCommit'], len(log) - 1)
+            # apply newly committed messages
+            # apply_messages()
+
+        curr_leader = append_entry_msg['leader']
+
+        # send reply if AppendEntries RPC was not a heartbeat
+        if len(append_entry_msg['entries']) > 0:
+            send_append_entry_reply(append_entry_msg)
+    else:
+        # send reply if AppendEntries RPC was not a heartbeat
+        if len(append_entry_msg['entries']) > 0:
+            send_append_entry_reply(append_entry_msg)
+
+
+def handle_receiving_append_entry_reply(append_entry_reply):
+    """Handles receiving append entry replies"""
+    global commitIndex, nextIndex, log
+
+    # replication/commits are not fully supported, currently committing all put requests immediately
+
+    if append_entry_reply['success'] and state == LEADER:
+        # rules for servers (leader): if successful: update nextIndex and matchIndex for follower
+
+        matchIndex[append_entry_reply['src']] = min(append_entry_reply['matchIndex'], len(log) - 1)
+        nextIndex[append_entry_reply['src']] = copy.deepcopy(matchIndex[append_entry_reply['src']]) + 1
+
+        # rules for servers (leader): if there exists an N such that N > commitIndex ...
+        if matchIndex[append_entry_reply['src']] > commitIndex:
+            quorum = 1
+
+            # ... a majority of matchIndex[i] >= N:
+            for replica_id in replica_ids:
+                if matchIndex[replica_id] >= matchIndex[append_entry_reply['src']]:
+                    quorum += 1
+
+            # ... and log[N].term == currentTerm
+
+            if quorum > (len(replica_ids) + 1) / 2 \
+                    and log[matchIndex[append_entry_reply['src']]]['term'] == currentTerm:
+                commitIndex = copy.deepcopy(matchIndex[append_entry_reply['src']])
+                # apply commits if needed
+                apply_messages()
+
+                # send get responses if possible
+                send_get_responses()
+
+
+    elif not append_entry_reply['success']:
+        # rules for servers (leader): if AppendEntries fails because of log inconsistency: decrement nextIndex and retry
+        nextIndex[append_entry_reply['src']] -= 1
+
+
+def send_request_vote():
+    """sends a RequestVote message to other replicas after starting an election"""
+    global sock, log, currentTerm, commitIndex
+
+    request_vote_message = {
+        'src': my_id,
+        'dst': 'FFFF',
+        'leader': "FFFF",
+        'type': 'request_vote',
+        'term': currentTerm,
+        'lastLogIndex': len(log) - 1 if len(log) > 1 else 0,
+        'lastLogTerm': log[len(log) - 1]['term'] if len(log) > 1 else 0
+    }
+    send_msg(request_vote_message)
+
+
+def redirect_request(requestMsg):
+    """sends a redirect message to the client when a client sends a request to a non-leader replica"""
+    global sock, curr_leader
+
+    requestMsg['leader'] = curr_leader
+    requestMsg['src'] = my_id
+    requestMsg['dst'] = curr_leader
+    requestMsg['type'] = 'redirect'
+    send_msg(requestMsg)
+
+
+def send_request_vote_reply(message, voteGranted):
+    """sends a RequestVote reply to a candidate who sent a RequestVote message"""
+    global votedFor, sock, curr_leader, currentTerm
+
+    request_vote_message = {
+        'src': my_id,
+        'dst': message['src'],
+        'type': 'request_vote_reply',
+        'leader': curr_leader,
+        'term': currentTerm,
+        'voteGranted': voteGranted
+    }
+
+    send_msg(request_vote_message)
+    # record that this replica has already voted for a candidate this term if true
+    if voteGranted:
+        votedFor = request_vote_message['dst']
+
+
+def start_election():
+    """ Starts an election. It increments the current term, updates who it voted for to itself, change the state,
+     and sends vote reuqests to the other replicas"""
+    global state, currentTerm, votedFor, states, curr_leader, votesReceived
+
+    # increment term
+    currentTerm += 1
+    # restart the election timeout
+    restart_election_timeout()
+    # vote for yourself
+    votedFor = my_id
+    # convert to candidate state
+    state = CANDIDATE
+    votesReceived = 1
+
+    curr_leader = "FFFF"
+
+    # send RequestVote RPCs to other candidates
+    send_request_vote()
+
+
+def send_get_response(message):
+    """sends a response to the client for a get request"""
+    global sock, curr_leader, get_mids
+
+    value = data[message['key']]
+    get_response = {
+        'src': my_id,
+        'dst': message['src'],
+        'leader': my_id,
+        'type': 'ok',
+        'MID': message['MID'],
+        'value': value
+    }
+    send_msg(get_response)
+
+
+def send_put_response(message):
+    """sends a response to the client for a put request"""
+    global sock, curr_leader
+
+    put_response = {
+        'src': my_id,
+        'dst': message['src'],
+        'leader': my_id,
+        'type': 'ok',
+        'MID': message['MID'],
+    }
+    send_msg(put_response)
+
+
+def send_redirect(message):
+    """sends a redirect message to the client (when replica is not the leader and receives a request)"""
+    global sock, curr_leader
+
+    redirect = {
+        'src': my_id,
+        'dst': message['src'],
+        'leader': curr_leader,
+        'type': 'redirect',
+        'MID': message['MID']
+    }
+
+    send_msg(redirect)
+
+
+def process_request(message):
+    """applies a client request as if this replica is the leader"""
+    if message['type'] == 'put':
+        data[message['key']] = message['value']
+
+        if state == LEADER and original_request(message):
+            send_put_response(message)
+
+
+def apply_messages():
+    """applies messages that have been recently committed"""
+    global lastApplied, log
+
+    # rules for servers (all servers): if commitIndex > lastApplied: increment lastApplied,
+    # apply log[lastApplied] to state machine
+    while commitIndex > lastApplied:
+        lastApplied += 1
+
+        process_request(log[lastApplied])
+
+
+def send_append_entries():
+    """sends the appropriate AppendEntries RPC to each replica"""
+    # index of log entry immediately preceding new ones
+    # if we are committing 1 message at a time, subtract 1 + 1 = 2
+    prevLogIndex = len(log) - 2 if len(log) > 2 else 0
+    # term of prevLogIndex entry
+    prevLogTerm = log[prevLogIndex]['term'] if prevLogIndex > 0 else 0
+    entries = []
+
+    append_entry_msg = {
+        'src': my_id,
+        'dst': 'FFFF',
+        'leader': my_id,
+        'type': 'append_entry',
+        'term': currentTerm,
+        'prevLogIndex': prevLogIndex,
+        'prevLogTerm': prevLogTerm,
+        'entries': entries,
+        'leaderCommit': commitIndex
+    }
+
+    # if there are messages to send, send them, if not, send heartbeat
+    for replica_id in replica_ids:
+        append_entry_msg['dst'] = replica_id
+        append_entry_msg['prevLogIndex'] = nextIndex[replica_id] - 1 if nextIndex[replica_id] > 1 else 0
+        append_entry_msg['prevLogTerm'] = log[append_entry_msg['prevLogIndex']]['term'] if nextIndex[
+                                                                                               replica_id] > 1 else 0
+
+        # 0 1 2 + 3 4
+        # nextIndex = 3
+        if len(log) - 1 >= nextIndex[replica_id]:
+            append_entry_msg['entries'] = log[nextIndex[replica_id]:]
+        else:
+            pass
+        send_msg(append_entry_msg)
+
+
+def equal_requests(request1, request2):
+    """returns True if the requests are the same except for MID"""
+    try:
+        request1NoMID = copy.deepcopy(request1)
+        del request1NoMID['MID']
+
+        request2NoMID = copy.deepcopy(request2)
+        del request2NoMID['MID']
+
+        return request1NoMID == request2NoMID
+    except KeyError:
+        return False
+
+
+def original_request(request):
+    """returns true if this request requires a new action to be taken"""
+    global log
+
+    count_duplicates = 0
+
+    for log_request in log[:commitIndex]:
+        try:
+            if log_request['MID'] == request['MID']:
+                count_duplicates += 1
+        except KeyError:
+            pass
+
+    if count_duplicates <= 1:
+        return True
+    else:
+        # raise ValueError("DUPLICATE FOUND")
+        return False
+
+
+def process_log():
+    """converts log to state machine for a newly elected leader"""
+    global data
+    data.clear()
+
+    if len(log) > 1:
+        for request_index in range(1, commitIndex + 1):
+            request = log[request_index]
+            data[request['key']] = request['value']
+
+
+def send_get_responses():
+    """sends get responses if the appropriate number of commits is reached"""
+    requests_to_remove = []
+
+    for lastPutIndex, get_request in unresponded_gets:
+        # if the last put request before the get was committed, send a get response
+        if commitIndex >= lastPutIndex:
+            send_get_response(get_request)
+            requests_to_remove.append((lastPutIndex, get_request))
+
+    # remove responded get requests from list of unresponded gets
+    for request_to_remove in requests_to_remove:
+        unresponded_gets.remove(request_to_remove)
+
+
+def should_send_get_response(get_request):
+    """returns True if the latest put in this get request has been committed"""
+    if getLastPutIndex(get_request) is None:
+        return True
+    else:
+        lastPutRequest = log[getLastPutIndex(get_request)]
+        try:
+            return lastPutRequest['value'] == data[get_request['key']]
+        except KeyError:
+            return False
+
+
+def getLastPutIndex(get_request):
+    """retrieves the index of the last put request with the same key as that of a get request"""
+    if len(log) > 1:
+        for log_index in range(len(log) - 1, 0, -1):
+            log_entry = log[log_index]
+            if log_entry['type'] == 'put' and log_entry['key'] == get_request['key']:
+                return log_index
+
+    return None
+
+
+def process_get(get_request):
+    """sends a get response to the given request if all put requests with the given key have been applied"""
+    if should_send_get_response(get_request):
+        send_get_response(get_request)
+    elif getLastPutIndex(get_request) is not None:
+        unresponded_gets.append((getLastPutIndex(get_request), get_request))
+    else:
+        send_fail()
+
+
+def send_msg(msg):
+    """sends a message if it is blocked"""
+    global sock
+    ready2 = select.select([], [sock], [], SELECT_WAIT_TIME)[1]
+    if sock in ready2:
+        sock.send(json.dumps(msg).encode() + b'\n')
+
+
+def add_to_log(request):
+    global log
+    """adds a request to the log as long as there isnt a request with the same MID and a later term already present"""
+    # if len(log) > 1:
+    #     for log_entry in log[1:]:
+    #         if log_entry['key'] == request['key'] and log_entry['term'] >= request['term']:
+    #             # do not append the entry if log contains a request with the same key and a greater or equal term
+    #             return
+
+    # may get rid of "irrelevant" log requests which may cause more unanswered requests L tbh
+    log.append(request)
+
+
+while True:
+    ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
+
+    if sock in ready:
+        msgs = recv_msgs()
+
+        for msg in msgs:
+
+            if msg['type'] in ['request_vote', 'request_vote_reply', 'append_entry', 'append_entry_reply']:
+                # HANDLING RPCS
+
+                # Update the current term if the message's term is higher than the replica's term
+                if msg['term'] > currentTerm:
+                    currentTerm = msg['term']
+                    votedFor = None
+                    state = FOLLOWER
+                    curr_leader = msg['leader']
+                    votesReceived = 1
+                if msg['type'] == 'request_vote':
+                    handle_receiving_request_vote(msg)
+                elif msg['type'] == 'request_vote_reply':
+                    handle_receiving_request_vote_reply(msg)
+                elif msg['type'] == 'append_entry':
+                    handle_receiving_append_entry_msg(msg)
+                elif msg['type'] == 'append_entry_reply':
+                    handle_receiving_append_entry_reply(msg)
+            elif msg['type'] in ['get', 'put']:
+                # add term to this message
+                msg['term'] = currentTerm
+
+                # if msg['type'] == 'get':
+                #     raise ValueError("GET RECEIVED")
+
+                # HANDLING CLIENT REQUESTS
+                if curr_leader == "FFFF":
+
+                    # if current leader is unknown, the replica is in candidate stage and cannot process requests.
+                    # add requests to a buffer to be processed later when the leader is known
+                    if msg not in queue:
+                        queue.append(msg)
+
+                elif curr_leader == my_id:
+
+                    # add first message
+                    if len(log) == 0:
+                        log.append({"first message": True})
+
+                    # process get requests right away, store put requests in log
+                    if msg['type'] == 'get':
+                        # send_get_response(msg)
+                        process_get(msg)
+                    elif msg not in log:
+                        add_to_log(msg)
+
+                    # if the replica is the leader, send AppendEntries RPC to replicas
+                    # send_append_entry([msg])
+                    send_append_entries()
+                else:
+                    # if the replica is a follower and the leader is known, then redirect the request to the leader
+                    send_redirect(msg)
+
+    curr_time = current_milli_time()
+    if state != LEADER and curr_time - election_timeout_last > election_timeout:
+        # if election timeout has expired and the replica is not a leader, start an election
+        start_election()
+    if state == LEADER and curr_time - heartbeat_last > 100:
+        # if the heartbeat timeout has expired (140 ms) and the replica is a leader, send another heartbeat message
+        send_append_entries()
+
+        heartbeat_last = curr_time
