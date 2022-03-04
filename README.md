@@ -3,39 +3,26 @@
 Candice Mac and Mouhamadou Sissoko -- CS3700 -- 12/17/21
 ***
 
+An implementation of the [Raft consensus algorithm](https://raft.github.io/) for a distributed key-value store written in Python. Raft provides a solution to log replication, a functionality that stores requests in each instance of the datastore and processes the requests when the instance is the leader of the distributed system.   
+
 ## Approach
-***
 
 ### Leader Election
 
-Talk about what was successful from section 5.2: leader election:
-For our leader election, we essentially started off with initializing our election timeouts and heartbeat timeouts. Once
-we set that up, we made it so that if, time between messages is greater than the election time out, then we would start
-an election. After we implemented the starting of elections, we sent out request votes and the candidate with at least
-Number of Replicas / 2 then the that candidate wins the election and immediately sends out heartbeats. For our
-implementation of leader election, some election restrictions that we added are being at least-up-to-date with the
-majority of the cluster, we use our request vote rpc to enforce this. It will either decline the vote for the candidate,
-if the candidate isn't at least up to date with its log or accept the vote, if it is.
+All requests and responses made to the datastore are processed through the leader node of the distributed system. Leader election describes the processes and conditions that must take place for a node to become a leader. 
+
+An election timeout and heartbeat timeout is established for all nodes. The heartbeat timeout resets when a non-leader node receives a message from the leader node. If the leader node crashes and the heartbeat timeout is reached, then the node will send request vote messages to its neighbors. After receiving majority votes, the node will be elected as a leader. A non-leader node votes for another node if the election timing is appropriate and if the requester's log is up to date. 
 
 ### Log Replication
 
-For our implementation of log replication, we start off by handling client requests that are sent to non-leaders, by
-simply redirecting them to the leader. In the event that the leader, receives a client request, it'll start by appending
-the message to its log and sending append entries to the other replicas. Once the replicas receive the append entries,
-they append it to their own logs and sends a reply back that has a field, which indicates whether it was successful or
-not. If it is successful, the leader will increment its quorum and in the case that it isn't successful, we decrement
-the nextIndex and send it with the next batch of entries, after the heartbeat election is over. For our quorum, we don't
-commit on our end, until we get a majority of replicas have succeeded in accepting the append entry and once we do, we
-will passively commit on the other replicas with an append entry. Followers send the reply with the success field as
-false, if the term of the leader is less than the follower's term or if the log doesn't contain an entry as the leader's
-most recent log index at the time the append entry rpc was sent. We also handle conflicting entries, by removing the
-conflicting entries in the log and everything after it
+When a leader receives a request, it has to send the request to the other nodes in the system to ensure that all logs are up to date. This is log replication. 
+
+After receiving a request, the leader will store the request in its own log and send the request to other nodes. When a node receives a log entry from the leader, the node decides whether to add the entry to its log, depending on the index of the entry provided. Log entries that are duplicates or inconsistent with the node's log will not be added. When a node receives an entry that conflicts with its log, all conflicting entries are removed from the log. The node sends a message to the leader, indicating whether the entry was successfully added. The leader continues to send requests only when a majority of the nodes have successfully added the entry. When a majority of the nodes have added an entry, the entry is committed to the leader's state machine. Now, this request can be processed by the leader, and the leader will send a response back to the client. If a leader receives a message indicating that the entry was not appended, it sends the previous entry to the node, assuming that the node is not up to date. Eventually, the node will contain a fully replicated log.
 
 ###         
 
 ## Challenges
 
-***
 We had a problem where the matchIndex was not increasing monotonically as nextIndex was being incremented, and this is
 because our best approach to incrementing matchIndex at success was to set it to nextIndex - 1, which may not be true
 when an AppendEntries RPC is accepted with multiple entries. In the end, we were able to successfully increment
@@ -49,6 +36,5 @@ higher drop rate.
 
 ## Testing
 
-***
 We used the sim.py to test how our program handles different scenarios, including leader and replica failures, drops,
 and network partitioning. 
